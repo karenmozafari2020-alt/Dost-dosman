@@ -10,7 +10,7 @@ const path = require('path');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = '0.0.0.0';
-const DB_DIR = path.join(__dirname, 'data');
+const DB_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = path.join(DB_DIR, 'db.json');
 const APK_PATH = '/home/user/Dost_in_Prehistoric_Karen.apk';
 
@@ -152,6 +152,26 @@ function getLeaderboard(limit = 20) {
 const clients = new Map(); // clientId -> ClientSession
 const rooms = new Map();   // roomCode -> RoomState
 
+// Only connected, authenticated human accounts; no seeded or offline records.
+function getOnlineLeaderboard() {
+  const entries = new Map();
+  for (const session of clients.values()) {
+    if (!session.isOpen || !session.authenticated) continue;
+    const account = db.accounts[session.playerId] || {};
+    const room = rooms.get(session.roomCode);
+    const player = room && room.players.get(session.playerId);
+    entries.set(session.playerId, {
+      name: session.username, rating: account.rating || 1000,
+      kills: account.kills || 0, deaths: account.deaths || 0,
+      wins: account.wins || 0, max_level: account.max_level || 1,
+      match_kills: player ? player.kills : 0,
+      level: player ? player.level : 1,
+      status: player ? 'در مسابقه' : 'در منو'
+    });
+  }
+  return [...entries.values()].sort((a,b) => b.rating-a.rating || b.kills-a.kills || a.name.localeCompare(b.name));
+}
+
 function createRoom({ isPrivate = false, mode = 'gun_progression', mapId = 0, levelStep = 1, demoteRule = 1 }) {
   let code = '';
   do {
@@ -168,6 +188,9 @@ function createRoom({ isPrivate = false, mode = 'gun_progression', mapId = 0, le
     team_red_score: 0,
     team_blue_score: 0,
     matchEnded: false,
+    host_id: "",
+    bot_count: 0,
+    ai_difficulty: 1,
     players: new Map(), // playerId -> PlayerRoomState
     createdAt: Date.now()
   };
@@ -202,12 +225,15 @@ function serializeRoom(room) {
       level: p.level,
       kills: p.kills,
       deaths: p.deaths,
-      team: p.team
+      team: p.team,
+      is_bot: Boolean(p.isBot), hp: p.hp, max_hp: p.maxHp || 100,
+      alive: p.alive, position: p.position
     };
   }
   return {
     code: room.code,
     private: room.isPrivate,
+    host_id: room.host_id, bot_count: room.bot_count, ai_difficulty: room.ai_difficulty,
     mode: room.mode,
     map_id: room.map_id,
     level_step: room.level_step,
@@ -236,6 +262,14 @@ function removePlayerFromCurrentRoom(session) {
   if (!room) return;
 
   room.players.delete(session.playerId);
+  if (room.host_id === session.playerId) {
+    room.host_id = [...room.players.values()].find(p => !p.isBot)?.id || '';
+    broadcastToRoom(room, {t:'room_settings', host_id:room.host_id, bot_count:room.bot_count, ai_difficulty:room.ai_difficulty});
+  }
+  if (![...room.players.values()].some(p => !p.isBot)) {
+    for (const [id,p] of room.players) if(p.isBot) room.players.delete(id);
+    room.bot_count = 0;
+  }
   broadcastToRoom(room, { t: 'plr_left', id: session.playerId });
 
   if (room.players.size === 0 && rooms.size > 1) {
@@ -293,6 +327,7 @@ function joinPlayerToRoom(session, room) {
   };
 
   room.players.set(session.playerId, pState);
+  if (!room.host_id) room.host_id = session.playerId;
   session.roomCode = room.code;
 
   session.sendJson({
@@ -311,6 +346,142 @@ function joinPlayerToRoom(session, room) {
       team: pState.team
     }
   }, session.playerId);
+}
+
+
+// Authoritative online bots: a single 10Hz simulation per room, never per phone.
+const MAP_BOXES = require('./maps.json');
+const BOT_TUNING = [
+  {hp:72,speed:3.9,think:1000,cooldown:2.1,accuracy:0.38,damage:0.65},
+  {hp:100,speed:5.4,think:550,cooldown:1.4,accuracy:0.62,damage:0.85},
+  {hp:120,speed:6.8,think:280,cooldown:1.0,accuracy:0.80,damage:1.0},
+  {hp:145,speed:7.8,think:140,cooldown:0.8,accuracy:0.94,damage:1.0}
+];
+function botInfo(p) {
+ return {id:p.id,name:p.name,level:p.level,kills:p.kills,deaths:p.deaths,team:p.team,
+ is_bot:true,hp:p.hp,max_hp:p.maxHp,alive:p.alive,position:p.position};
+}
+function clearShot(map, a, b) {
+ for(const box of MAP_BOXES[map] || []) {
+   let lo=0,hi=1;
+   for(let axis=0;axis<3;axis++) {
+     const d=b[axis]-a[axis];
+     if(Math.abs(d)<0.00001) {if(a[axis]<box[axis] || a[axis]>box[axis+3]) {lo=2;break;}}
+     else {const t1=(box[axis]-a[axis])/d,t2=(box[axis+3]-a[axis])/d;
+       lo=Math.max(lo,Math.min(t1,t2));hi=Math.min(hi,Math.max(t1,t2));}
+   }
+   if(lo<=hi && hi>0.01 && lo<0.99) return false;
+ }
+ return true;
+}
+function walkable(map,x,z) {
+ if(Math.abs(x)>45 || Math.abs(z)>45) return false;
+ return !(MAP_BOXES[map] || []).some(b => b[4]>0.18 && b[1]<1.85 &&
+  x>b[0]-0.65 && x<b[3]+0.65 && z>b[2]-0.65 && z<b[5]+0.65);
+}
+function botSpawn(room,seed) {
+ let best=null,score=-1;
+ for(let i=0;i<40;i++) {
+  const angle=(i+seed)*2.39996, x=Math.round(Math.cos(angle)*40),z=Math.round(Math.sin(angle)*40);
+  if(!walkable(room.map_id,x,z)) continue;
+  const enemies=[...room.players.values()].filter(p=>p.alive && p.position);
+  const distance=enemies.length?Math.min(...enemies.map(p=>Math.hypot(x-p.position.x,z-p.position.z))):50;
+  if(distance>score){score=distance;best={x,y:0,z,yaw:0,pitch:0};}
+ }
+ return best || {x:40,y:0,z:0,yaw:0,pitch:0};
+}
+// Breadth-first grid routing avoids the same map cover on all clients.
+function route(room,from,to) {
+ const cell=p=>[Math.max(-22,Math.min(22,Math.round(p.x/2))),Math.max(-22,Math.min(22,Math.round(p.z/2)))];
+ const start=cell(from),goal=cell(to),key=(x,z)=>x+','+z;
+ const queue=[start],parents=new Map([[key(...start),null]]);
+ let end=start,best=Infinity;
+ for(let i=0;i<queue.length && i<2100;i++) {
+  const [x,z]=queue[i],d=(x-goal[0])**2+(z-goal[1])**2;
+  if(d<best){best=d;end=[x,z];} if(d===0)break;
+  for(const [dx,dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+   const nx=x+dx,nz=z+dz,k=key(nx,nz);
+   if(parents.has(k)||!walkable(room.map_id,nx*2,nz*2))continue;
+   parents.set(k,[x,z]);queue.push([nx,nz]);
+  }
+ }
+ const path=[];let n=end;
+ while(n && key(...n)!==key(...start)){path.push({x:n[0]*2,z:n[1]*2});n=parents.get(key(...n));}
+ return path.reverse();
+}
+function configureBots(room,count,difficulty) {
+ const humans=[...room.players.values()].filter(p=>!p.isBot).length;
+ room.bot_count=boundedInt(count,0,0,Math.min(8,12-humans));
+ room.ai_difficulty=boundedInt(difficulty,1,0,3);
+ // Reconfigure atomically; announce removals then one canonical snapshot for each bot.
+ for(const [id,p] of room.players)if(p.isBot){room.players.delete(id);broadcastToRoom(room,{t:'plr_left',id});}
+ for(let i=0;i<room.bot_count;i++) {
+  const id='srvbot_'+room.code+'_'+i, now=Date.now(),tune=BOT_TUNING[room.ai_difficulty];
+  const session={playerId:id,roomCode:room.code,authenticated:true,isOpen:false,sendJson(){}};
+  const p={id,name:'AI '+(i+1),isBot:true,level:1,hp:tune.hp,maxHp:tune.hp,kills:0,deaths:0,
+    team:room.mode==='tdm'?(i%2)+1:0,alive:true,respawnAt:0,spawnShieldUntil:now+2500,
+    position:botSpawn(room,i),lastStateAt:now,stateHistory:[],lastHitTimeMs:0,lastSeq:-1,
+    lastAttackSeq:0,lastAttackAt:0,lastHeavyAt:0,attackRecords:new Map(),session,
+    rethinkAt:0,fireAt:now+2500,path:[],targetId:'',botSeq:0};
+  room.players.set(id,p);broadcastToRoom(room,{t:'plr_joined',player:botInfo(p)});
+ }
+ broadcastToRoom(room,{t:'room_settings',host_id:room.host_id,bot_count:room.bot_count,ai_difficulty:room.ai_difficulty});
+}
+function tickBots(now=Date.now()) {
+ for(const room of rooms.values()) {
+  if(room.matchEnded || ![...room.players.values()].some(p=>!p.isBot))continue;
+  const tune=BOT_TUNING[room.ai_difficulty];
+  for(const p of room.players.values()) {
+   if(!p.isBot)continue;
+   if(!p.alive){
+    if(now<p.respawnAt)continue;
+    p.alive=true;p.hp=p.maxHp;p.position=botSpawn(room,p.deaths);p.spawnShieldUntil=now+2800;
+    p.path=[];p.rethinkAt=0;
+    broadcastToRoom(room,{t:'bot_respawn',player:botInfo(p)});
+   }
+   p.lastStateAt=now;
+   if(now>=p.rethinkAt){
+    p.rethinkAt=now+tune.think;
+    const enemies=[...room.players.values()].filter(v=>v!==p&&v.alive&&v.position&&
+      (!p.team||v.team!==p.team)&&now-v.lastStateAt<1500);
+    enemies.sort((a,b)=>Math.hypot(a.position.x-p.position.x,a.position.z-p.position.z)-Math.hypot(b.position.x-p.position.x,b.position.z-p.position.z));
+    p.targetId=enemies[0]?.id||'';
+    const target=room.players.get(p.targetId);
+    p.path=target?route(room,p.position,target.position):[];
+   }
+   const target=room.players.get(p.targetId);
+   let vx=0,vz=0;
+   if(target && target.alive) {
+    const dx=target.position.x-p.position.x,dz=target.position.z-p.position.z,dist=Math.hypot(dx,dz);
+    p.position.yaw=Math.atan2(-dx,-dz);
+    const stats=getWeaponStatsForLevel(p.level);
+    const origin=[p.position.x,p.position.y+1.5,p.position.z];
+    const targetPoint=[target.position.x,target.position.y+1,target.position.z];
+    const visible=clearShot(room.map_id,origin,targetPoint);
+    const stop=stats.isMelee?2.6:Math.min(18,stats.maxRange*0.6);
+    if(dist>stop||!visible){
+      while(p.path.length && Math.hypot(p.path[0].x-p.position.x,p.path[0].z-p.position.z)<0.45)p.path.shift();
+      const dest=p.path[0];
+      if(dest){const x=dest.x-p.position.x,z=dest.z-p.position.z,d=Math.hypot(x,z),step=Math.min(d,tune.speed*0.1);
+       if(d>0.01){vx=x/d*step*10;vz=z/d*step*10;
+        if(walkable(room.map_id,p.position.x+vx*0.1,p.position.z+vz*0.1)){p.position.x+=vx*0.1;p.position.z+=vz*0.1;}else{vx=0;vz=0;}}
+      }
+    }
+    if(visible && dist<stats.maxRange && now>=p.fireAt && now>p.spawnShieldUntil){
+      p.fireAt=now+stats.minCooldownMs*tune.cooldown+150;
+      const seq=++p.botSeq;
+      const o=[p.position.x,p.position.y+1.5,p.position.z];
+      const vector=targetPoint.map((v,i)=>v-o[i]),len=Math.hypot(...vector),dir=vector.map(v=>v/len);
+      const actualStats={...stats,damage:stats.damage*tune.damage};
+      p.attackRecords.set(seq,{seq,level:p.level,stats:actualStats,origin:o,dir,createdAt:now,heavy:false,used:false});
+      while(p.attackRecords.size>10)p.attackRecords.delete(p.attackRecords.keys().next().value);
+      broadcastToRoom(room,{t:'atk',id:p.id,w:p.level,o, d:dir});
+      if(Math.random()<tune.accuracy)handleClientMessage(p.session,JSON.stringify({t:'hit',seq,atk_seq:seq,vic_id:target.id}));
+    }
+   }
+   broadcastToRoom(room,{t:'s',id:p.id,d:[p.position.x,p.position.y,p.position.z,p.position.yaw,0,vx,vz,Math.abs(vx)+Math.abs(vz)>0.1?1:0]});
+  }
+ }
 }
 
 // ============================================================================
@@ -445,6 +616,7 @@ function handleClientMessage(session, msgStr) {
         targetRoom = createRoom({ isPrivate: false, mode, mapId, levelStep: 1, demoteRule: 1 });
       }
       joinPlayerToRoom(session, targetRoom);
+      if (targetRoom.host_id === session.playerId && msg.bot_count !== undefined) configureBots(targetRoom,msg.bot_count,msg.ai_difficulty);
       break;
     }
 
@@ -458,6 +630,7 @@ function handleClientMessage(session, msgStr) {
         demoteRule: msg.demote_rule !== undefined ? msg.demote_rule : 1
       });
       joinPlayerToRoom(session, room);
+      configureBots(room,msg.bot_count || 0,msg.ai_difficulty);
       break;
     }
 
@@ -474,6 +647,16 @@ function handleClientMessage(session, msgStr) {
 
     case 'leave_room': {
       removePlayerFromCurrentRoom(session);
+      break;
+    }
+
+    case 'bot_settings': {
+      const room = rooms.get(session.roomCode);
+      if (!room || room.host_id !== session.playerId || room.matchEnded) {
+        session.sendJson({t:'room_err',msg:'فقط سازندهٔ فعلی اتاق می‌تواند بات‌ها را تنظیم کند.'});
+        return;
+      }
+      configureBots(room, msg.bot_count, msg.ai_difficulty);
       break;
     }
 
@@ -619,6 +802,7 @@ function handleClientMessage(session, msgStr) {
       const minAimDot = melee ? 0.16 : (attack.level === 300 ? 0.60 : 0.48);
       if (aimDot < minAimDot) return;
 
+      if (!clearShot(room.map_id, attack.origin, target)) return;
       attack.used = true;
       attacker.lastHitTimeMs = now;
       const damage = attack.heavy
@@ -636,7 +820,7 @@ function handleClientMessage(session, msgStr) {
       if (victim.hp > 0) break;
 
       // A kill and all progression/profile changes are committed only here.
-      victim.hp = 100;
+      victim.hp = victim.maxHp || 100;
       victim.alive = false;
       victim.respawnAt = now + 2600;
       victim.deaths += 1;
@@ -725,6 +909,7 @@ function handleClientMessage(session, msgStr) {
 // ============================================================================
 
 const server = http.createServer((req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -737,17 +922,18 @@ const server = http.createServer((req, res) => {
 
   const urlPath = (req.url || '/').split('?')[0];
 
-  if (urlPath === '/api/status') {
+  if (urlPath === '/api/status' || urlPath === '/api/online') {
     const apkExists = fs.existsSync(APK_PATH);
     const apkSizeMb = apkExists ? (fs.statSync(APK_PATH).size / (1024 * 1024)).toFixed(1) : 0;
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
       ok: true,
+      server_version: '1.3.1',
       game: 'Dost in Prehistoric Karen',
       studio: 'Karen Studios',
-      online_players: clients.size,
+      online_players: getOnlineLeaderboard().length,
       active_rooms: getPublicRoomsList(),
-      leaderboard: getLeaderboard(10),
+      leaderboard: getOnlineLeaderboard(),
       apk_ready: apkExists,
       apk_size_mb: apkSizeMb
     }));
@@ -770,101 +956,27 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Serve Persian Server Status & Direct APK Download Portal
-  const apkExists = fs.existsSync(APK_PATH);
-  const apkSizeMb = apkExists ? (fs.statSync(APK_PATH).size / (1024 * 1024)).toFixed(1) : '0';
-  const lbRows = getLeaderboard(10)
-    .map((e, i) => `<tr><td>#${i + 1}</td><td>${e.name}</td><td>${e.rating}</td><td>${e.kills}</td><td>${e.wins}</td><td>Lv.${e.max_level} / 300</td></tr>`)
-    .join('');
-
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(`<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Dost in Prehistoric Karen | سرور آنلاین و دانلود مستقیم APK</title>
-  <style>
-    * { box-sizing: border-box; font-family: Tahoma, system-ui, sans-serif; }
-    body { margin: 0; background: #090d18; color: #eef6ff; padding: 24px; }
-    .container { max-width: 920px; margin: 0 auto; }
-    .hero {
-      background: linear-gradient(135deg, #101b35, #1e1035);
-      border: 2px solid #00f5e5;
-      border-radius: 16px;
-      padding: 24px;
-      box-shadow: 0 12px 32px rgba(0, 245, 229, 0.15);
-      margin-bottom: 20px;
-    }
-    h1 { margin: 0 0 8px 0; color: #ffdf38; font-size: 26px; }
-    .sub { color: #00f5e5; font-size: 15px; margin-bottom: 18px; }
-    .btn-apk {
-      display: inline-block;
-      background: linear-gradient(90deg, #00f5d4, #00bbf9);
-      color: #06101e;
-      font-weight: bold;
-      font-size: 18px;
-      padding: 14px 28px;
-      border-radius: 10px;
-      text-decoration: none;
-      margin-top: 8px;
-    }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 20px; }
-    .card { background: #11182b; border: 1px solid #283a63; border-radius: 12px; padding: 16px; }
-    .card h3 { margin-top: 0; color: #ffdf38; }
-    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-    th, td { padding: 10px; border-bottom: 1px solid #223052; text-align: right; }
-    th { color: #00f5e5; }
-    code { background: #060913; color: #00f5e5; padding: 4px 8px; border-radius: 6px; direction: ltr; display: inline-block; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="hero">
-      <h1>🎮 Dost in Prehistoric Karen — Karen Studios</h1>
-      <div class="sub">سرور اختصاصی بلادرنگ (TCP_NODELAY WebSocket) + دانلود مستقیم فایل نصبی اندروید (APK)</div>
-      <p>وضعیت سرور آنلاین: <strong style="color:#38ff7a;">🟢 فعال و آماده اتصال (۲۰ هرتز، پینگ فوق‌پایین)</strong></p>
-      <p>پروتکل اتصال داخل بازی: <code id="ws-url">wss://8080-${process.env.E2B_SANDBOX_ID || 'localhost'}.e2b.app</code></p>
-      ${apkExists
-        ? `<a class="btn-apk" href="/download/Dost_in_Prehistoric_Karen.apk">📲 دانلود مستقیم فایل Dost_in_Prehistoric_Karen.apk (${apkSizeMb} MB)</a>`
-        : `<p style="color:#ffaa38;">در حال آماده‌سازی فایل APK...</p>`}
-    </div>
-
-    <div class="grid">
-      <div class="card">
-        <h3>⚡ مسیر تکامل ۳۰۰ سلاح</h3>
-        <ul>
-          <li><strong>لول ۱–۱۰ (عصر چوب):</strong> شروع با چوب بیسبال ماقبل تاریخ، چماق و گرز</li>
-          <li><strong>لول ۱۱–۳۰ (عصر سنگ):</strong> نیزه چخماق، تبر ابسیدین و فلاخن</li>
-          <li><strong>لول ۳۱–۷۵ (عصر جنگجویان):</strong> شمشیر، کمان، زوبین و چاکرام</li>
-          <li><strong>لول ۷۶–۱۵۰ (عصر فناوری):</strong> تپانچه، شاتگان، اسنایپر و مینی‌گان</li>
-          <li><strong>لول ۱۵۱–۲۹۹ (عصر انرژی):</strong> تفنگ پلاسما، توپ تسلا و پادماده</li>
-          <li><strong>لول ۳۰۰ (عصر افسانه‌ای Karen):</strong> تفنگ لیزری افسانه‌ای Karen ⚡</li>
-        </ul>
-      </div>
-      <div class="card">
-        <h3>🗺️ نقشه‌ها و حالت‌های بازی</h3>
-        <ul>
-          <li><strong>Prehistoric Jungle:</strong> جنگل باستانی، رودخانه و غارها</li>
-          <li><strong>Ancient Arena:</strong> میدان باستانی، برجک‌ها و مسیرهای مخفی</li>
-          <li><strong>Cyber Ruins:</strong> خرابه‌های ماقبل تاریخ و راکتورهای نئونی Karen</li>
-          <li><strong>حالت‌ها:</strong> Gun Progression، Free For All، Team Deathmatch، Private Match و Practice vs AI + همراه هوشمند Dost</li>
-        </ul>
-      </div>
-    </div>
-
-    <div class="card">
-      <h3>🏆 جدول رتبه‌بندی زنده سرور (Leaderboard)</h3>
-      <table>
-        <thead>
-          <tr><th>رتبه</th><th>نام جنگجو</th><th>امتیاز</th><th>کیل</th><th>برد</th><th>بالاترین لول سلاح</th></tr>
-        </thead>
-        <tbody>${lbRows}</tbody>
-      </table>
-    </div>
-  </div>
-</body>
-</html>`);
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(`<!doctype html>
+<html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>بازیکنان آنلاین | Dost</title><style>
+*{box-sizing:border-box}body{margin:0;background:#080d18;color:#e8f4ff;font-family:Tahoma,Arial,sans-serif;padding:28px}main{max-width:1100px;margin:auto}header{border:1px solid #20cfc0;background:#111d30;padding:28px;border-radius:18px}h1{color:#5cf5d8;margin:0 0 12px}p{line-height:1.9;color:#aac1d9}.badge{color:#ffd966;font-size:20px}.table{overflow:auto;margin-top:24px;border:1px solid #263b56;border-radius:14px}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{padding:16px;text-align:right;border-bottom:1px solid #25364a}th{background:#13233a;color:#61e9da}tbody tr:hover{background:#101e32}.empty{text-align:center;padding:40px;color:#a6bbcf}#error{color:#ffac92}footer{margin-top:20px;color:#90a7bf;font-size:13px}button{background:#31debd;border:0;border-radius:8px;padding:10px 18px;font-weight:bold;cursor:pointer}
+</style></head><body><main><header><h1>Dost in Prehistoric Karen</h1><div>KAREN STUDIOS · لیدربرد زنده</div>
+<p>تمام بازیکنان واقعی که اکنون به سرور متصل‌اند؛ شامل بازیکنان داخل منو و مسابقه. بات‌ها و حساب‌های آفلاین در این فهرست نیستند.</p>
+<div class="badge">بازیکنان آنلاین: <strong id="count">—</strong></div><p>رتبه‌بندی بر اساس امتیاز حساب و مجموع کیل‌هاست؛ کیل و لول مسابقه نیز جدا نمایش داده می‌شود.</p><button id="refresh">بروزرسانی</button><div id="error" role="status"></div></header>
+<div class="table"><table><thead><tr><th>رتبه</th><th>بازیکن</th><th>وضعیت</th><th>امتیاز</th><th>کل کیل‌ها</th><th>مرگ‌ها</th><th>بردها</th><th>کیل مسابقه</th><th>لول مسابقه</th></tr></thead><tbody id="players"></tbody></table><div id="empty" class="empty">در حال دریافت بازیکنان…</div></div><footer>بروزرسانی خودکار هر ۵ ثانیه · <span id="updated"></span> · سرور 1.3.1</footer></main>
+<script>
+let busy=false;
+async function update(){if(busy)return;busy=true;try{
+ const response=await fetch('/api/online',{cache:'no-store'});if(!response.ok)throw new Error('HTTP '+response.status);
+ const data=await response.json(),list=data.leaderboard||[],body=document.getElementById('players');body.replaceChildren();
+ list.forEach((p,i)=>{const row=document.createElement('tr');[i+1,p.name,p.status,p.rating,p.kills,p.deaths,p.wins,p.match_kills,p.level].forEach(value=>{const cell=document.createElement('td');cell.textContent=String(value);row.appendChild(cell)});body.appendChild(row)});
+ document.getElementById('count').textContent=list.length;document.getElementById('empty').hidden=list.length>0;
+ document.getElementById('empty').textContent='در حال حاضر بازیکنی آنلاین نیست.';
+ document.getElementById('error').textContent='';document.getElementById('updated').textContent='آخرین دریافت: '+new Date().toLocaleTimeString('fa-IR');
+ }catch(e){document.getElementById('error').textContent='ارتباط با سرور برقرار نشد؛ فهرست ممکن است قدیمی باشد.'}finally{busy=false}}
+document.getElementById('refresh').onclick=update;update();setInterval(update,5000);
+</script></body></html>`);
 });
 
 server.on('upgrade', (req, socket) => {
@@ -981,6 +1093,8 @@ server.on('upgrade', (req, socket) => {
   socket.on('close', cleanup);
   socket.on('error', cleanup);
 });
+
+setInterval(() => tickBots(), 100).unref();
 
 server.listen(PORT, HOST, () => {
   console.log(`[KAREN SERVER] Dost in Prehistoric Karen Online Server listening on http://${HOST}:${PORT}`);
